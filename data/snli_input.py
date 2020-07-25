@@ -12,7 +12,7 @@ from .bert_formatter import convert_single_instance
 MINCOUNT = 1
 
 def read_snli_line(s):
-    segs = s.split('\t')
+    segs = s.strip().split('\t')
     gold_label, \
     sentence1_binary_parse, sentence2_binary_parse, \
     sentence1_parse, sentence2_parse, \
@@ -32,8 +32,13 @@ def parse_fn(line, encode=True, with_char=False, bert_out=False, bert_proj_path=
     sentence1_parse, sentence2_parse, \
     sentence1, sentence2, \
     captionID, pair_id, label15 = read_snli_line(line)
-    premise_words = [w.encode() if encode and not bert_out else w for w in sentence1.split()]
-    hypothesis_words = [w.encode() if encode and not bert_out else w for w in sentence2.split()]
+    premise_words = ['<SOS>']
+    premise_words.extend([w.encode() if encode and not bert_out else w for w in sentence1_binary_parse.split() if not w in ('(', ')')])
+    premise_words.append('<EOS>')
+
+    hypothesis_words = ['<SOS>']
+    hypothesis_words.extend([w.encode() if encode and not bert_out else w for w in sentence2_binary_parse.split() if not w in ('(', ')')])
+    premise_words.append('<EOS>')
 
     n_premise_words, n_hypothesis_words = len(premise_words), len(hypothesis_words)
     if bert_out:
@@ -60,8 +65,13 @@ def generator_fn(fname, encode=True, with_char=False, bert_out=False, bert_proj_
     with Path(fname).expanduser().open('r') as fid:
         next(fid) # 跳过首行
         for line in fid:
-            yield parse_fn(line, encode=encode, with_char=with_char,
+            _, label = parse_fn(line, encode=encode, with_char=with_char,
                                bert_out=bert_out, bert_proj_path=bert_proj_path, bert_config_json=bert_config_json, max_seq_len=max_seq_len)
+            label_str = label.decode().strip() if encode else label.strip()
+            if label_str == '-':
+                continue
+            # print('{}\ {}'.format(label, line))
+            yield _, label
 
 def input_fn(file, params=None, shuffle_and_repeat=False, with_char=False, bert_out=False,
              bert_proj_path=None, bert_config_json=None, max_seq_len=512):
@@ -97,7 +107,7 @@ def input_fn(file, params=None, shuffle_and_repeat=False, with_char=False, bert_
         if not with_char:
             shapes = (([None], ()), ([None], ()), ()), ()
             types = ((tf.string, tf.int32), (tf.string, tf.int32), tf.string), tf.string
-            defaults = (('<pad>', 0), ('<pad>', 0), 'empty'), '-'
+            defaults = (('<pad>', 0), ('<pad>', 0), 'empty'), 'neutral'
         else:
             shapes = (
                 (
@@ -134,7 +144,7 @@ def input_fn(file, params=None, shuffle_and_repeat=False, with_char=False, bert_
                .prefetch(1))
     return dataset
 
-def build_vocab(files, output_dir, min_count=MINCOUNT, force_build=False, encode=False):
+def build_vocab(files, output_dir, min_count=MINCOUNT, force_build=False, encode=False, top_freq_words=None):
     # 1. Words
     # Get Counter of words on all the data, filter by min count, save
 
@@ -159,8 +169,7 @@ def build_vocab(files, output_dir, min_count=MINCOUNT, force_build=False, encode
             counter_words.update(hypothesis_words)
             vocab_labels.add(label)
 
-    vocab_words = {w for w, c in counter_words.items() if c >= min_count}
-
+    vocab_words = {w for i, (w, c) in enumerate(counter_words.most_common(top_freq_words if top_freq_words and top_freq_words > 0 else None)) if c >= min_count}
 
     with Path(words_path).expanduser().open('w') as f:
         for w in sorted(list(vocab_words)):
@@ -201,7 +210,7 @@ def build_glove(words_file='vocab.words.txt', output_path='glove.npz', glove_pat
     size_vocab = len(word_to_idx)
 
     # Array of zeros
-    embeddings = np.zeros((size_vocab, 300))
+    embeddings = np.random.randn(size_vocab, 300) * 0.01
 
     # Get relevant glove vectors
     found = 0

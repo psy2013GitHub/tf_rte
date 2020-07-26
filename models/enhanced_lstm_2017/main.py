@@ -14,6 +14,8 @@ from tensorflow.python import array_ops
 from tensorflow.python import debug as tf_debug
 from tf_metrics import precision, recall, f1
 from models.common.embedding_layer import embedding_layer
+from models.common.model_utils import get_train_op
+from models.common.metrics import err
 
 # import tensorflow.contrib.eager as tfe
 # tfe.enable_eager_execution()
@@ -138,7 +140,7 @@ def model_fn(features, labels, mode, params):
             # todo 此处词不在glove表格咋办？，比如某些稀有名词
             glove = np.load(str(Path(params['glove']).expanduser()))['embeddings']  # np.array
             variable = np.vstack([[[0.]*params['dim']], glove]) # pad 0
-            variable = np.vstack([variable, np.zeros((params['num_oov_buckets'], params['dim']),)]) # num_oov_buckets
+            variable = np.vstack([variable, np.random.randn(params['num_oov_buckets'], params['dim']) * 0.01]) # num_oov_buckets
             variable = tf.Variable(variable, dtype=tf.float32, trainable=True)
             premise_embeddings = tf.nn.embedding_lookup(variable, premise_word_ids, name='premise_embeddings')
             hypothesis_embeddings = tf.nn.embedding_lookup(variable, hypothesis_word_ids, name='hypothesis_embeddings')
@@ -217,6 +219,7 @@ def model_fn(features, labels, mode, params):
             'precision': precision(labels, pred_ids, num_classes, indices),
             'recall': recall(labels, pred_ids, num_classes, indices),
             'f1': f1(labels, pred_ids, num_classes, indices),
+            'err': err(labels, pred_ids)
         }
         for metric_name, op in metrics.items():
             tf.summary.scalar(metric_name, op[1])
@@ -226,8 +229,10 @@ def model_fn(features, labels, mode, params):
                 mode, loss=loss, eval_metric_ops=metrics)
 
         elif mode == tf.estimator.ModeKeys.TRAIN:
-            train_op = tf.train.AdamOptimizer(learning_rate=params['learning_rate']).minimize(
-                loss, global_step=tf.train.get_or_create_global_step())
+            train_op, learning_rate, gnorm = get_train_op(params['optimizer'], loss)
+            tf.summary.scalar('learning_rate', learning_rate)
+            # train_op = tf.train.AdamOptimizer(learning_rate=params['optimizer']['learning_rate']).minimize(
+            #     loss, global_step=tf.train.get_or_create_global_step())
             return tf.estimator.EstimatorSpec(
                 mode, loss=loss, train_op=train_op)
 
@@ -245,11 +250,10 @@ if __name__ == '__main__':
         'buffer': 15000, # ？
         'lstm_size': 300,
         'hidden_dim': 300,
-        'learning_rate': 4e-4,
-        'force_build_vocab': True,
+        'force_build_vocab': False,
         'vocab_dir': './',
         'rand_embedding': False, # 随机初始化embedding
-        'force_build_glove': True,
+        'force_build_glove': False,
         'glove': './glove.npz',
         'pretrain_glove': '~/.datasets/embeddings/glove.840B.300d/glove.840B.300d.txt',
         'files': [
@@ -258,7 +262,17 @@ if __name__ == '__main__':
             '~/.datasets/rte/snli_1.0/snli_1.0_test.txt'
         ],
         'DATADIR': '~/.datasets/rte/snli_1.0/',
-        'RESULT_DIR': './results/'
+        'RESULT_DIR': './results/',
+        'optimizer': {
+            'learning_rate': 4e-4,
+            'warmup_steps': 0,
+            'decay_method': None,
+            'weight_decay': 0,
+            'train_steps': 26000,
+            'min_lr_ratio': 0.001,
+            'clip': 10,
+            'adam_epsilon': 1e-8
+        }
     }
 
     init_log_path(params['RESULT_DIR'])
@@ -299,10 +313,11 @@ if __name__ == '__main__':
     estimator = tf.estimator.Estimator(model_fn, model_path, cfg, params)
     Path(estimator.eval_dir()).mkdir(parents=True, exist_ok=True)
     hooks = [
-        tf.estimator.experimental.stop_if_no_decrease_hook(estimator, 'acc', 50, min_steps=8000, run_every_secs=120),
+        tf.estimator.experimental.stop_if_no_decrease_hook(estimator, 'err', 100, min_steps=8000, run_every_secs=120),
         # tf_debug.LocalCLIDebugHook(ui_type="readline"),
     ]
-    train_spec = tf.estimator.TrainSpec(input_fn=train_inpf, hooks=hooks)
+    # todo 根据validation set上表现来调节learning rate https://github.com/tensorflow/tensorflow/issues/41740
+    train_spec = tf.estimator.TrainSpec(input_fn=train_inpf, hooks=hooks, max_steps=params['optimizer']['train_steps'])
     eval_spec = tf.estimator.EvalSpec(input_fn=eval_inpf, throttle_secs=120)
     tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
 
